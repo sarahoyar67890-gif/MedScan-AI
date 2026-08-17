@@ -387,9 +387,21 @@ with tab_dashboard:
 
         st.markdown('<hr class="hairline">', unsafe_allow_html=True)
         st.markdown("#### Benign vs. suspicious-pattern")
-        st.bar_chart(
-            {"benign-pattern": [stats["benign_count"]], "suspicious-pattern": [stats["suspicious_count"]]},
-            horizontal=True,
+        benign_dash_pct = 100 - suspicious_pct
+        st.markdown(
+            f"""
+            <div class="msc-card msc-card-tight">
+              <div class="prob-row">
+                <div class="prob-row-label"><span>Benign-pattern</span><span>{stats['benign_count']} ({benign_dash_pct:.0f}%)</span></div>
+                <div class="prob-bar-track"><div class="prob-bar-fill" style="width:{benign_dash_pct:.1f}%; background:var(--signal-green);"></div></div>
+              </div>
+              <div class="prob-row" style="margin-bottom:0;">
+                <div class="prob-row-label"><span>Suspicious-pattern</span><span>{stats['suspicious_count']} ({suspicious_pct:.0f}%)</span></div>
+                <div class="prob-bar-track"><div class="prob-bar-fill" style="width:{suspicious_pct:.1f}%; background:var(--signal-amber);"></div></div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
         metrics_path = config.METRICS_JSON_PATH
@@ -405,14 +417,23 @@ with tab_dashboard:
                 "not this dashboard's live traffic.</p>",
                 unsafe_allow_html=True,
             )
-            mcols = st.columns(4)
-            for col, key, label in zip(
-                mcols,
-                ["accuracy", "precision", "recall", "f1_score"],
-                ["Accuracy", "Precision", "Recall", "F1"],
-            ):
+            metric_defs = [
+                ("accuracy", "Accuracy"),
+                ("precision", "Precision"),
+                ("recall", "Recall"),
+                ("f1_score", "F1"),
+            ]
+            metrics_html = '<div class="metric-grid">'
+            for key, label in metric_defs:
                 val = test_metrics.get(key)
-                col.metric(label, f"{val*100:.1f}%" if val is not None else "—")
+                val_display = f"{val*100:.1f}%" if val is not None else "—"
+                metrics_html += f"""
+                <div class="metric-card">
+                  <div class="metric-label">{label}</div>
+                  <div class="metric-value">{val_display}</div>
+                </div>"""
+            metrics_html += "</div>"
+            st.markdown(metrics_html, unsafe_allow_html=True)
 
 # ---- History tab -------------------------------------------------------------
 with tab_history:
