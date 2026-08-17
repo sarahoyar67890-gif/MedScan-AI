@@ -11,6 +11,6 @@ data/processed/*
 !data/processed/.gitkeep
 outputs/*
 !outputs/.gitkeep
-checkpoints/*
-!checkpoints/.gitkeep
 .pytest_cache/
+checkpoints/*
+!checkpoints/medscan_resnet18_best.pt
