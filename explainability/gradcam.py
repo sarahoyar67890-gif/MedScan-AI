@@ -90,7 +90,11 @@ def overlay_heatmap_on_image(
     # matplotlib.cm.get_cmap() was deprecated in 3.7 and removed in 3.9;
     # matplotlib.colormaps[...] is the version-safe way to look up a colormap
     # by name across the >=3.7.0 range this project supports.
-    colormap_fn = cm.colormaps[colormap] if hasattr(cm, "colormaps") else cm.get_cmap(colormap)
+    try:
+        import matplotlib
+        colormap_fn = matplotlib.colormaps[colormap]
+    except Exception:
+        colormap_fn = cm.get_cmap(colormap)
     colored_heatmap = colormap_fn(heatmap_arr)[:, :, :3]  # drop alpha channel from colormap
     colored_heatmap = np.uint8(colored_heatmap * 255)
 
