@@ -100,6 +100,48 @@ CSS_EXTRAS = """
   font-size: 0.62rem;
   padding: 0.2rem 0.5rem;
 }
+
+/* ---------- file uploader (brand override) ----------
+   Streamlit's default uploader ships a red "Browse files" button and
+   generic icon that clash against the teal identity everywhere else.
+   Selectors target Streamlit's current data-testid; if your installed
+   version renders different testids, adjust these two selectors only. */
+[data-testid="stFileUploaderDropzone"] {
+  background: var(--surface-2);
+  border-radius: var(--radius-md);
+}
+[data-testid="stFileUploaderDropzone"] button {
+  background: var(--surface);
+  color: var(--accent-deep);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-weight: 500;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+[data-testid="stFileUploaderDropzone"] button:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-deep);
+}
+[data-testid="stFileUploaderDropzone"] small {
+  color: var(--ink-muted);
+  font-family: 'IBM Plex Sans', sans-serif;
+}
+
+/* ---------- spinner (brand override) ---------- */
+[data-testid="stSpinner"] > div > div {
+  border-top-color: var(--accent) !important;
+  border-right-color: var(--accent-soft) !important;
+  border-bottom-color: var(--accent-soft) !important;
+  border-left-color: var(--accent-soft) !important;
+}
+[data-testid="stSpinner"] p {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.85rem;
+  color: var(--ink-muted);
+  letter-spacing: 0.04em;
+}
 </style>
 """
 
