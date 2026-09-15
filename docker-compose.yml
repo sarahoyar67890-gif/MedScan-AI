@@ -1,0 +1,30 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MEDSCAN_CORS_ORIGINS=${MEDSCAN_CORS_ORIGINS:-http://localhost:8501}
+    volumes:
+      # Trained weights and outputs are generated locally (training/evaluation
+      # aren't run inside these containers) — mount them read/write so both
+      # services see the same checkpoint and history database.
+      - ./checkpoints:/app/checkpoints
+      - ./outputs:/app/outputs
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./outputs:/app/outputs
+    depends_on:
+      - backend
+    restart: unless-stopped
