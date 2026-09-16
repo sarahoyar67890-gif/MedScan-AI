@@ -3,9 +3,14 @@ storage/db.py — Lightweight SQLite store for analysis history.
 
 Deliberately not a "real" database — this is a portfolio app meant to run
 locally or in a single small container, and SQLite is the honest choice at
-that scale (zero setup, no extra service, no extra failure mode). Stores
-only what's needed for the dashboard/history views: no images are persisted
-to disk, only metadata about each analysis.
+that scale (zero setup, no extra service, no extra failure mode).
+
+v2 change: now also saves the uploaded image itself to disk
+(outputs/scan_images/) and stores its path, so History/Progress can show
+real thumbnails and a genuine side-by-side "compare two scans" view instead
+of metadata-only rows. Existing databases are migrated in place (a new
+nullable image_path column is added if missing) — no data is lost, and rows
+recorded before this change simply have image_path = None.
 
 Every write is wrapped so a storage failure never breaks the analysis flow
 itself — history is a nice-to-have, not a dependency of the core feature.
@@ -15,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +32,7 @@ import config
 log = logging.getLogger(__name__)
 
 DB_PATH: Path = config.OUTPUTS_DIR / "medscan_history.db"
+IMAGES_DIR: Path = config.OUTPUTS_DIR / "scan_images"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS analyses (
@@ -64,6 +71,7 @@ class AnalysisRecord:
     model_stage: Optional[str]
     model_epoch: Optional[int]
     source: str
+    image_path: Optional[str] = None
 
 
 @contextmanager
@@ -78,12 +86,40 @@ def _connect() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate_add_image_path(conn: sqlite3.Connection) -> None:
+    """Adds the image_path column to a pre-v2 database in place. Safe to
+    call on every startup — it's a no-op once the column already exists."""
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(analyses)").fetchall()}
+    if "image_path" not in existing_cols:
+        conn.execute("ALTER TABLE analyses ADD COLUMN image_path TEXT")
+        log.info("Migrated analyses table: added image_path column")
+
+
 def init_db() -> None:
     try:
         with _connect() as conn:
             conn.executescript(SCHEMA)
+            _migrate_add_image_path(conn)
     except sqlite3.Error:
         log.exception("Failed to initialize history database at %s", DB_PATH)
+
+
+def _save_image(image_bytes: bytes, original_filename: str) -> Optional[str]:
+    """Saves the uploaded image under outputs/scan_images/ with a random
+    filename (so uploads with the same name never collide) and returns its
+    path, or None if saving failed — a failure here never blocks recording
+    the analysis itself."""
+    try:
+        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        ext = Path(original_filename).suffix.lower()
+        if ext not in (".jpg", ".jpeg", ".png"):
+            ext = ".jpg"
+        stored_path = IMAGES_DIR / f"{uuid.uuid4().hex}{ext}"
+        stored_path.write_bytes(image_bytes)
+        return str(stored_path)
+    except OSError:
+        log.exception("Failed to save scan image for %s", original_filename)
+        return None
 
 
 def record_analysis(
@@ -99,22 +135,26 @@ def record_analysis(
     model_stage: Optional[str] = None,
     model_epoch: Optional[int] = None,
     source: str = "streamlit",
+    image_bytes: Optional[bytes] = None,
 ) -> Optional[int]:
     """Best-effort write. Returns the new row id, or None if the write failed
-    (failure is logged, never raised — history must never break analysis)."""
+    (failure is logged, never raised — history must never break analysis).
+    If image_bytes is provided, the image is saved to disk and its path is
+    stored alongside the record, enabling real thumbnails and scan comparison."""
+    image_path = _save_image(image_bytes, filename) if image_bytes else None
     try:
         with _connect() as conn:
             cur = conn.execute(
                 """INSERT INTO analyses
                    (created_at, filename, image_width, image_height, predicted_label,
                     is_suspicious, confidence, prob_benign, prob_suspicious,
-                    inference_ms, model_stage, model_epoch, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    inference_ms, model_stage, model_epoch, source, image_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     filename, image_width, image_height, predicted_label,
                     int(is_suspicious), confidence, prob_benign, prob_suspicious,
-                    inference_ms, model_stage, model_epoch, source,
+                    inference_ms, model_stage, model_epoch, source, image_path,
                 ),
             )
             return cur.lastrowid
@@ -133,6 +173,18 @@ def get_recent(limit: int = 20) -> list[AnalysisRecord]:
     except sqlite3.Error:
         log.exception("Failed to read recent analyses")
         return []
+
+
+def get_by_id(record_id: int) -> Optional[AnalysisRecord]:
+    """Used by the Progress page's scan-comparison view to fetch two
+    specific records by id."""
+    try:
+        with _connect() as conn:
+            row = conn.execute("SELECT * FROM analyses WHERE id = ?", (record_id,)).fetchone()
+            return AnalysisRecord(**dict(row)) if row else None
+    except sqlite3.Error:
+        log.exception("Failed to fetch analysis id=%s", record_id)
+        return None
 
 
 def get_stats() -> dict:
