@@ -1,25 +1,25 @@
 """
-app/app.py — MedScan AI Streamlit application (v3 — dermatology assistant).
+app/app.py — MedScan AI Streamlit application (v4 — full dermatology assistant).
 
 Run from the project root:
     streamlit run app/app.py
 
-Architecture note: this app calls `inference.predictor` directly (in-process)
-rather than over HTTP, so the demo works as a single process with no extra
-moving parts. The FastAPI service in `backend/main.py` wraps the *same*
-predictor module for API consumers — both share one source of truth for
-model loading and inference logic.
+v4 adds real functionality on top of v3's restructuring (not just visuals):
+  - Pre-inference image quality assessment (inference/quality.py) shown
+    before analysis, with a required override checkbox for poor-quality images.
+  - Uploaded images are now saved (storage/db.py v2) so History/Progress can
+    show real thumbnails and a genuine side-by-side scan comparison.
+  - A real, structured PDF report (reports/report_generator.py via
+    reportlab) replaces the plain-text download.
+  - A "Compare two scans" view on the Progress page using saved images.
+  - Sidebar identity substantially reworked in app/style_guidance.py (dark
+    gradient matching the hero panel, clear active-state nav).
 
-v3 change (structural, not a rebuild): navigation moved from st.tabs to a
-real sidebar (st.session_state-driven), and the result view now renders
-educational guidance content from knowledge/skin_conditions.py after every
-prediction. The prediction pipeline, Grad-CAM, batch analysis, history, and
-model-info logic are unchanged from v2 — they've just been moved under new
-page names so the existing functionality keeps working exactly as before.
+The prediction pipeline itself (ResNet18, Grad-CAM, validation) is
+unchanged — this version adds a layer of genuinely new product features
+around it, not just a different color scheme.
 """
 
-import io
-import json
 import logging
 import sys
 from pathlib import Path
@@ -28,16 +28,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import json
+
 import pandas as pd
 import streamlit as st
 
 import config
 from app import style, style_extras, style_guidance
 from inference.predictor import InferenceError, ModelNotReadyError, get_predictor
+from inference.quality import assess_quality
 from inference.validation import ImageValidationError, validate_image_bytes
 from knowledge.skin_conditions import (
     DISCLAIMER as GUIDANCE_DISCLAIMER,
-    GUIDANCE_BY_SCREENING_RESULT,
     INGREDIENT_EXPLAINER,
     SKIN_KNOWLEDGE_CENTER,
     get_guidance_for_result,
@@ -56,38 +58,6 @@ st.set_page_config(
 style.inject(st)
 style_extras.inject_extras(st)
 style_guidance.inject_guidance(st)
-
-# Scoped, self-contained CSS for the sidebar nav buttons (kept local to this
-# file rather than added to style_guidance.py, so this step doesn't require
-# re-touching a file already in place).
-st.markdown(
-    """
-    <style>
-    [data-testid="stSidebar"] .stButton > button {
-      background: transparent;
-      color: var(--ink-muted);
-      border: none;
-      border-radius: var(--radius-sm);
-      text-align: left;
-      justify-content: flex-start;
-      font-weight: 500;
-      padding: 0.55rem 0.9rem;
-      width: 100%;
-      box-shadow: none;
-    }
-    [data-testid="stSidebar"] .stButton > button:hover {
-      background: var(--surface-2);
-      color: var(--ink);
-    }
-    [data-testid="stSidebar"] .stButton > button[kind="primary"] {
-      background: var(--accent-soft) !important;
-      color: var(--accent-deep) !important;
-      border-left: 2px solid var(--accent) !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 db.init_db()
 
@@ -112,8 +82,27 @@ def render_state_card(kind: str, icon: str, title: str, desc: str) -> None:
     )
 
 
+def render_quality_badges(report) -> None:
+    """NEW in v4. Shows the pre-inference quality report as badges + any
+    warnings, before the user commits to running the model."""
+    badge_class = report.overall.lower()
+    st.markdown(
+        f"""
+        <div class="quality-badge-row">
+          <span class="quality-badge {badge_class}">Image Quality: {report.overall}</span>
+          <span class="quality-badge {badge_class}">{report.width}×{report.height}px</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if report.warnings:
+        warn_html = "<div class='quality-warning-list'>" + "".join(
+            f"<div>⚠ {w}</div>" for w in report.warnings
+        ) + "</div>"
+        st.markdown(warn_html, unsafe_allow_html=True)
+
+
 def render_result_card(result) -> None:
-    """Unchanged from v2 — prediction, confidence, probability bars, Grad-CAM."""
     badge_class = "badge-amber" if result.is_suspicious else "badge-green"
     badge_text = "Suspicious-pattern" if result.is_suspicious else "Benign-pattern"
     probs = result.probabilities
@@ -173,11 +162,9 @@ def render_result_card(result) -> None:
 
 
 def render_guidance_sections(is_suspicious: bool) -> None:
-    """NEW in v3. Renders the educational dermatology-assistant sections
-    (contributing factors, what to avoid, general care, management
-    approaches, when to see a dermatologist) using the static, reviewed
-    content in knowledge/skin_conditions.py — nothing here is generated by
-    a model."""
+    """Renders the educational dermatology-assistant sections using the
+    static, reviewed content in knowledge/skin_conditions.py — nothing here
+    is generated by a model."""
     label = config.CLASS_NAMES[1] if is_suspicious else config.CLASS_NAMES[0]
     guidance = get_guidance_for_result(label)
 
@@ -248,63 +235,22 @@ def render_guidance_sections(is_suspicious: bool) -> None:
     )
 
 
-def build_report_text(result, filename: str) -> str:
-    """Generates a real, plain-text analysis summary from the actual result
-    and static guidance content — no fabricated numbers, no invented
-    sources. Returned as text so it can be offered as a download without
-    adding a PDF dependency in this step."""
-    label = config.CLASS_NAMES[1] if result.is_suspicious else config.CLASS_NAMES[0]
-    guidance = get_guidance_for_result(label)
-    lines = [
-        "MEDSCAN AI — ANALYSIS SUMMARY",
-        "=" * 40,
-        f"File: {filename}",
-        f"Screening result: {result.label}",
-        f"Model confidence: {result.confidence*100:.1f}%",
-        f"Benign-pattern probability: {result.probabilities[config.CLASS_NAMES[0]]*100:.1f}%",
-        f"Suspicious-pattern probability: {result.probabilities[config.CLASS_NAMES[1]]*100:.1f}%",
-        f"Model stage / epoch: {result.model_stage} / {result.model_epoch}",
-        "",
-        "WHY COULD THIS HAPPEN?",
-        guidance["summary"],
-        guidance["what_happens_in_skin"],
-        "",
-        "POSSIBLE CONTRIBUTING FACTORS",
-        *[f"- {f['factor']}: {f['note']}" for f in guidance["contributing_factors"]],
-        "",
-        "WHAT TO AVOID",
-        *[f"- {i['action']} (Why: {i['why']})" for i in guidance["avoid"]],
-        "",
-        "WHAT YOU CAN DO",
-        *[f"- {i['action']} (Why: {i['why']})" for i in guidance["general_care"]],
-        "",
-        "COMMON MANAGEMENT APPROACHES",
-        *[f"- {m}" for m in guidance["management_approaches"]],
-        "",
-        "WHEN TO SEE A DERMATOLOGIST",
-        *[f"- {w}" for w in guidance["when_to_see_dermatologist"]],
-        "",
-        guidance["reliability_note"],
-        GUIDANCE_DISCLAIMER,
-    ]
-    return "\n".join(lines)
-
-
 def run_prediction(raw_bytes: bytes, filename: str, content_type: str, source: str = "streamlit"):
-    """Unchanged from v2. Validate + predict + record history. Returns (result, error_message)."""
+    """Validate + predict + record history (now including the saved image).
+    Returns (result, record_id, error_message)."""
     try:
         validated = validate_image_bytes(raw_bytes, filename=filename, content_type=content_type)
     except ImageValidationError as e:
-        return None, str(e)
+        return None, None, str(e)
 
     try:
         result = predictor.predict(validated)
     except ModelNotReadyError as e:
-        return None, str(e)
+        return None, None, str(e)
     except InferenceError as e:
-        return None, str(e)
+        return None, None, str(e)
 
-    db.record_analysis(
+    record_id = db.record_analysis(
         filename=filename,
         predicted_label=result.label,
         is_suspicious=result.is_suspicious,
@@ -317,12 +263,38 @@ def run_prediction(raw_bytes: bytes, filename: str, content_type: str, source: s
         model_stage=result.model_stage,
         model_epoch=result.model_epoch,
         source=source,
+        image_bytes=raw_bytes,
     )
-    return result, None
+    return result, record_id, None
+
+
+def offer_pdf_report(result, filename: str, record_id) -> None:
+    """Builds the real PDF report and offers it as a download. Fails soft —
+    if reportlab isn't installed or generation errors out, shows a small
+    caption instead of crashing the whole result view."""
+    try:
+        from reports.report_generator import generate_pdf_report
+        image_path = None
+        if record_id:
+            rec = db.get_by_id(record_id)
+            if rec and rec.image_path:
+                image_path = rec.image_path
+        pdf_bytes = generate_pdf_report(result, filename, original_image_path=image_path)
+        st.download_button(
+            "📄 Download analysis report (PDF)",
+            data=pdf_bytes,
+            file_name=f"medscan_report_{Path(filename).stem}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    except Exception:
+        log.exception("PDF report generation failed")
+        st.caption("Report generation is unavailable right now — check that `reportlab` is installed "
+                     "(`pip install reportlab`).")
 
 
 # ---------------------------------------------------------------------------
-# Sidebar navigation (v3 — replaces the old st.tabs bar)
+# Sidebar navigation
 # ---------------------------------------------------------------------------
 NAV_ITEMS = [
     ("🏠", "Dashboard"),
@@ -341,21 +313,36 @@ with st.sidebar:
     st.markdown(
         """
         <div class="msc-sidebar-brand">
-          <div class="name">MedScan AI</div>
-          <div class="tagline">AI Dermatology Intelligence</div>
+          <div class="glyph">M</div>
+          <div class="brand-text">
+            <div class="name">MedScan AI</div>
+            <div class="tagline">AI Dermatology Intelligence</div>
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    st.markdown('<div class="msc-sidebar-section-label">Navigate</div>', unsafe_allow_html=True)
     for icon, name in NAV_ITEMS:
         if st.button(f"{icon}  {name}", key=f"nav_{name}", use_container_width=True,
                       type="primary" if st.session_state.page == name else "secondary"):
             st.session_state.page = name
             st.rerun()
 
+    model_line = "ResNet18 · Ready" if MODEL_READY else "No checkpoint"
+    st.markdown(
+        f"""
+        <div class="msc-sidebar-footer">
+          MODEL &nbsp;·&nbsp; {model_line}<br>
+          Research Prototype · v4
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 page = st.session_state.page
 
-if not MODEL_READY and page in ("Skin Scan",):
+if not MODEL_READY and page == "Skin Scan":
     if model_status.error:
         render_state_card(
             "error", "⚠", "Checkpoint found but couldn't be loaded",
@@ -414,7 +401,7 @@ if page == "Dashboard":
         ("🔬", "AI Skin Analysis", "Upload a lesion photo and get a probability-based screening signal in seconds."),
         ("🧠", "Explainable Results", "Every prediction ships with a Grad-CAM visual explanation of what the model attended to."),
         ("🌿", "Skin Guidance", "Understand possible contributing factors, what to avoid, and general care — with the why."),
-        ("📈", "Progress Tracking", "Your analyses are saved locally so you can see patterns in your own usage over time."),
+        ("📈", "Progress Tracking", "Your analyses are saved so you can compare scans and see patterns over time."),
     ]
     cards_html = ""
     for icon, title, desc in feature_cards:
@@ -493,7 +480,7 @@ if page == "Dashboard":
 
 
 # =============================================================================
-# PAGE: Skin Scan (screening + batch, unchanged logic, guidance appended)
+# PAGE: Skin Scan
 # =============================================================================
 elif page == "Skin Scan":
     st.markdown('<span class="eyebrow">Pipeline</span>', unsafe_allow_html=True)
@@ -501,10 +488,11 @@ elif page == "Skin Scan":
 
     scan_steps = [
         ("01", "Image", "Upload a clear photo of a skin lesion (JPG or PNG)."),
-        ("02", "Analysis", "The image is validated, then a transfer-learned ResNet18 analyzes it."),
-        ("03", "Understanding", "Grad-CAM shows what the model attended to; guidance explains what it may mean."),
-        ("04", "Guidance", "Possible contributing factors, what to avoid, and general care — each with a why."),
-        ("05", "Report", "Download a plain-text summary of the full analysis."),
+        ("02", "Quality Check", "Resolution, blur, brightness, and contrast are assessed before analysis."),
+        ("03", "Analysis", "A transfer-learned ResNet18 analyzes the validated image."),
+        ("04", "Understanding", "Grad-CAM shows what the model attended to."),
+        ("05", "Guidance", "Contributing factors, what to avoid, and general care — each with a why."),
+        ("06", "Report", "Download a structured PDF summary of the full analysis."),
     ]
     progress_html = '<div class="scan-progress">'
     for i, (num, title, _) in enumerate(scan_steps):
@@ -559,31 +547,35 @@ elif page == "Skin Scan":
                     """,
                     unsafe_allow_html=True,
                 )
-                analyze_clicked = st.button("Analyze image", use_container_width=True,
-                                             disabled=not MODEL_READY, key="analyze_single")
+
+                quality_report = assess_quality(preview.image)
+                render_quality_badges(quality_report)
+
+                proceed_ok = True
+                if quality_report.should_block:
+                    proceed_ok = st.checkbox(
+                        "I understand the image quality may reduce reliability — analyze anyway",
+                        key="quality_override",
+                    )
+
+                analyze_clicked = st.button(
+                    "Analyze image", use_container_width=True,
+                    disabled=(not MODEL_READY) or (not proceed_ok), key="analyze_single",
+                )
 
             if analyze_clicked:
                 with st.spinner("Analyzing…"):
-                    result, error = run_prediction(
+                    result, record_id, error = run_prediction(
                         raw_bytes, uploaded_file.name, uploaded_file.type, source="streamlit"
                     )
                 if error:
                     render_state_card("error", "⚠", "Analysis failed", error)
                 else:
-                    st.session_state["last_result_filename"] = uploaded_file.name
                     st.markdown('<hr class="hairline">', unsafe_allow_html=True)
                     st.markdown('<span class="eyebrow">Result</span>', unsafe_allow_html=True)
                     render_result_card(result)
                     render_guidance_sections(result.is_suspicious)
-
-                    report_text = build_report_text(result, uploaded_file.name)
-                    st.download_button(
-                        "📄 Download analysis summary (.txt)",
-                        data=report_text,
-                        file_name=f"medscan_summary_{uploaded_file.name}.txt",
-                        mime="text/plain",
-                        use_container_width=True,
-                    )
+                    offer_pdf_report(result, uploaded_file.name, record_id)
 
         except ImageValidationError as e:
             render_state_card("error", "⚠", "This file can't be used", str(e))
@@ -612,7 +604,7 @@ elif page == "Skin Scan":
                 for i, f in enumerate(batch_files):
                     progress.progress(i / n, text=f"Analyzing {f.name} ({i+1}/{n})…")
                     raw = f.getvalue()
-                    result, error = run_prediction(raw, f.name, f.type, source="streamlit-batch")
+                    result, _, error = run_prediction(raw, f.name, f.type, source="streamlit-batch")
                     if error:
                         batch_html += f"""
                         <div class="batch-item">
@@ -642,7 +634,7 @@ elif page == "Skin Scan":
 
 
 # =============================================================================
-# PAGE: My Analysis (formerly the History tab — unchanged logic)
+# PAGE: My Analysis
 # =============================================================================
 elif page == "My Analysis":
     st.markdown('<span class="eyebrow">Log</span>', unsafe_allow_html=True)
@@ -675,13 +667,13 @@ elif page == "My Analysis":
         st.markdown(
             '<p class="msc-muted" style="font-size:0.8rem; margin-top:0.75rem;">'
             "History is stored locally in a SQLite file under outputs/ — nothing "
-            "leaves this machine.</p>",
+            "leaves this machine. Saved images live alongside it under outputs/scan_images/.</p>",
             unsafe_allow_html=True,
         )
 
 
 # =============================================================================
-# PAGE: Skin Guidance — guidance for your most recent scan, on its own page
+# PAGE: Skin Guidance
 # =============================================================================
 elif page == "Skin Guidance":
     st.markdown('<span class="eyebrow">Guidance</span>', unsafe_allow_html=True)
@@ -698,6 +690,8 @@ elif page == "Skin Guidance":
                            "Run a scan from the Skin Scan page to see personalized guidance here.")
     else:
         latest = recent[0]
+        if latest.image_path and Path(latest.image_path).exists():
+            st.image(latest.image_path, width=220)
         st.markdown(
             f"<p class='msc-muted' style='font-size:0.82rem;'>Based on: <b>{latest.filename}</b> "
             f"(analyzed {latest.created_at[:19].replace('T', ' ')})</p>",
@@ -707,7 +701,7 @@ elif page == "Skin Guidance":
 
 
 # =============================================================================
-# PAGE: Skin Knowledge — knowledge center + ingredient explainer
+# PAGE: Skin Knowledge
 # =============================================================================
 elif page == "Skin Knowledge":
     st.markdown('<span class="eyebrow">Education</span>', unsafe_allow_html=True)
@@ -781,7 +775,7 @@ elif page == "Skin Knowledge":
 
 
 # =============================================================================
-# PAGE: Progress — real trend from your own saved analysis history
+# PAGE: Progress — trend + real scan-to-scan comparison
 # =============================================================================
 elif page == "Progress":
     st.markdown('<span class="eyebrow">Trend</span>', unsafe_allow_html=True)
@@ -819,9 +813,56 @@ elif page == "Progress":
             unsafe_allow_html=True,
         )
 
+        st.markdown('<hr class="hairline">', unsafe_allow_html=True)
+        st.markdown('<span class="eyebrow">Compare</span>', unsafe_allow_html=True)
+        st.markdown("#### Compare two scans")
+
+        if len(recent) >= 2:
+            options = {f"#{r.id} · {r.filename} · {r.created_at[:19].replace('T', ' ')}": r.id for r in recent}
+            labels = list(options.keys())
+            col_a, col_b = st.columns(2)
+            with col_a:
+                pick_a = st.selectbox("Scan A", labels, index=0, key="compare_a")
+            with col_b:
+                pick_b = st.selectbox("Scan B", labels, index=1, key="compare_b")
+
+            rec_a = db.get_by_id(options[pick_a])
+            rec_b = db.get_by_id(options[pick_b])
+
+            if rec_a and rec_b:
+                st.markdown('<div class="compare-panel">', unsafe_allow_html=True)
+                for rec in (rec_a, rec_b):
+                    badge_class = "badge-amber" if rec.is_suspicious else "badge-green"
+                    badge_text = "Suspicious" if rec.is_suspicious else "Benign"
+                    st.markdown(
+                        f'<div class="compare-panel-card"><div class="compare-date">'
+                        f'{rec.created_at[:19].replace("T", " ")}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if rec.image_path and Path(rec.image_path).exists():
+                        st.image(rec.image_path, use_container_width=True)
+                    st.markdown(
+                        f'<span class="result-badge {badge_class}">{badge_text}</span> '
+                        f'&nbsp; {rec.confidence*100:.1f}% confidence</div>',
+                        unsafe_allow_html=True,
+                    )
+                st.markdown('</div>', unsafe_allow_html=True)
+
+                delta = (rec_b.confidence - rec_a.confidence) * 100
+                st.markdown(
+                    f"<p class='msc-muted' style='font-size:0.82rem; margin-top:0.7rem;'>"
+                    f"Model confidence changed by {delta:+.1f} percentage points between these two "
+                    f"scans. This reflects the model's output on these two specific images — it is "
+                    f"not evidence of a medically confirmed change, and does not confirm these are "
+                    f"even the same lesion.</p>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("Run at least 2 scans to compare them here.")
+
 
 # =============================================================================
-# PAGE: Settings (formerly "About & model info" — unchanged logic)
+# PAGE: Settings
 # =============================================================================
 elif page == "Settings":
     st.markdown('<span class="eyebrow">Under the hood</span>', unsafe_allow_html=True)
@@ -866,6 +907,8 @@ elif page == "Settings":
             <li>Dataset and labeling limitations mean real-world performance may not match test-set metrics.</li>
             <li>The Skin Knowledge Center and Ingredient Explainer contain general, static educational
                 content — not personalized medical advice, and not generated by the AI model.</li>
+            <li>Uploaded images are stored locally (outputs/scan_images/) only so you can review and
+                compare your own past scans — they are not sent anywhere else by this app.</li>
             <li>If you have a lesion that concerns you, please consult a qualified dermatologist or physician —
                 regardless of what this tool predicts.</li>
           </ul>
@@ -876,7 +919,7 @@ elif page == "Settings":
 
 
 # ---------------------------------------------------------------------------
-# Footer (unchanged, shown on every page)
+# Footer
 # ---------------------------------------------------------------------------
 st.markdown(
     """
